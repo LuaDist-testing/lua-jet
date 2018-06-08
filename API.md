@@ -23,17 +23,27 @@ The `config` table is optional. If provided all entries are optional too:
 ```lua
 local pi = peer.new({
   ip = '192.168.1.23', -- the jet daemon ip, default 'localhost'
-  port = '192.168.1.23', -- the jet daemon 'trivial' port, default 11122
+  port = '192.168.1.23', -- the jet daemon 'trivial' port, default 11122,
+  url = 'ws://jet.nodejitsu.com:80', -- use websocket socket transport with this (websocket) url
   name = 'foo', -- some name which will be assoc. at the daemon for debugging
   loop = my_loop, -- an lua-ev loop instance, default ev.Loop.default
   on_connect = print, -- a function which will be called 'on connect' to the daemon
   on_close = print, -- a function which will be called when the peer closes
   sync = false, -- creates sync working peer
 })
+
+-- connect to the public Jet hosted at nodejitsu
+local pi_nodejitsu = peer.new({
+  url = 'ws://jet.nodejitsu.com:80'
+})
+
+-- connect to the local (default) daemon
+local pi_local = peer.new()
 ```
 
+The `url` option overwrites the `ip` and `port` options.
 When the `config.sync` flag is set, the peer instance behaves very different than the 'default/async' one.
-The 'sync' peer is documented separatly.
+The 'sync' peer is documented separately.
 
 ### pi:close()
 
@@ -69,17 +79,19 @@ pi:set('persons/ae62a',{name='peter',age=33},{
 })
 ```
 
-### fetcher = pi:fetch(match|fetch_params,fetch_callback,[callbacks])
+### fetcher = pi:fetch(contains|fetch_params,fetch_callback,[callbacks])
 
 Creates a new fetcher. If the first parameter is a string, a 'fetch' message whith the following `fetch_params` is send to the daemon:
 
 ```lua
 fetch_params = {
-  matches = {match}
+  path = {
+    contains = contains
+  }
 }
 ```
 
-Else the `fetch_params` are used unmodified. If `fetch_params.sort` is not defined or is no valid sort option, the `fetch_callback` receives the parameters `(event,path,value,fetcher)`. The `event` can be either `add`, `change` or `remove`. `add` is always the first event. `change` means that the paths's associated `value` has changed and `remove` means that the state or method are not available at the Jet bus any longer. States and methods may become available any time later on, though. Note that `value` is `nil` for methods. 
+Else the `fetch_params` are used unmodified. If `fetch_params.sort` is not defined or is no valid sort option, the `fetch_callback` receives the parameters `(event,path,value,fetcher)`. The `event` can be either `add`, `change` or `remove`. `add` is always the first event. `change` means that the paths's associated `value` has changed and `remove` means that the state or method are not available at the Jet bus any longer. States and methods may become available any time later on, though. Note that `value` is `nil` for methods.
 
 ```lua
 local allstuff = pi:fetch('.*',function(event,path,value)
@@ -87,7 +99,7 @@ local allstuff = pi:fetch('.*',function(event,path,value)
 end)
 ```
 
-Else, if `fetch_params.sort` specifies a valid sort config, the `fetch_callback` receives the parameters `(changes,n)`. To minimize network traffic, only the changes are posted to the peers. `changes` is an array, which contains all entries within the requested sort range (`from`,`to`) which have been changed, added or moved. In addition to their respective `path` and `value` there is also the `index` field, specifying the position within the sort range. `n` denotes the number of elements that are currently in the requested sorted collection. `n` >= 0 and n <= (`to` - `from`). 
+Else, if `fetch_params.sort` specifies a valid sort config, the `fetch_callback` receives the parameters `(changes,n)`. To minimize network traffic, only the changes are posted to the peers. `changes` is an array, which contains all entries within the requested sort range (`from`,`to`) which have been changed, added or moved. In addition to their respective `path` and `value` there is also the `index` field, specifying the position within the sort range. `n` denotes the number of elements that are currently in the requested sorted collection. `n` >= 0 and n <= (`to` - `from`).
 
 ```lua
 local top_ten = {}
@@ -109,15 +121,18 @@ local show_top_ten = function(changes,n)
 end
 
 pi:fetch({
-    matches = {'player'},
+    path = {
+		startsWith = 'player'
+	},
 	sort = {
-	  byValue = true,    -- optional, default is false
+	  byValueField = {
+		  score = 'number',
+	  }
 	  descending = true, -- optional, default is false
-	  prop = 'score', -- optional, tells which entry of table to use as order criteria
 	  from = 1, -- optional, default is 1
 	  to = 10, -- optional, default is 10
 	}
-  },function(changes,n)    
+  },function(changes,n)
     print(changes,n)
   end)
 ```
@@ -179,7 +194,7 @@ local net_state = pi:state({
 })
 ```
 
-If the `path` is already in use by any peer, the error callback is called. The `set` and `set_async` callbacks must ot be defined at the same time for one state. If the `set` and `set_async` callback are not set, the state is considered read-only. 
+If the `path` is already in use by any peer, the error callback is called. The `set` and `set_async` callbacks must ot be defined at the same time for one state. If the `set` and `set_async` callback are not set, the state is considered read-only.
 
 #### set
 
@@ -191,7 +206,7 @@ local change_net = function(requested_net)
 end
 ```
 
-If `change_net` does not return a value and does not throw an error, `requested_net` is considered the new value of the state and a `change` notification is posted to the daemon automatically. 
+If `change_net` does not return a value and does not throw an error, `requested_net` is considered the new value of the state and a `change` notification is posted to the daemon automatically.
 
 ```lua
 local change_net = function(requested_net)
@@ -267,7 +282,7 @@ States can be created by a peer instance (`pi:state(...)`).
 ### state:remove([callbacks])
 
 Removes the state from the jet daemon. The state's `set` or `set_async` callbacks will not be called any more.
-The `callbacks` argument is optional. 
+The `callbacks` argument is optional.
 
 ```lua
 net:remove({
@@ -279,7 +294,7 @@ net:remove({
 ### state:add([value],[callbacks])
 
 Once removed, re-adds the state to the jet daemon. The state's `set` or `set_async` callbacks will be called again.
-The `value` and `callbacks` arguments are optional. 
+The `value` and `callbacks` arguments are optional.
 
 ```lua
 net:add({   -- provide a new value
@@ -305,8 +320,3 @@ If `new_val` is `nil` returns the state's current value. Else posts a change not
 local val = a_state:value() -- read current val
 a_state:value(val+1) -- post a state change
 ```
-
-
-
-
-

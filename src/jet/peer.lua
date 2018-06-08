@@ -1,97 +1,103 @@
 local jsocket = require'jet.socket'
+local has_websockets, websockets_ev = pcall(require, 'websocket.client_ev')
 local socket = require'socket'
 local ev = require'ev'
 local cjson = require'cjson'
-local require = require
-local pcall = pcall
-local pairs = pairs
-local ipairs = ipairs
-local setmetatable = setmetatable
-local type = type
-local error = error
-local print = print
+local jutils = require'jet.utils'
+
 local tinsert = table.insert
 local tremove = table.remove
 local tconcat = table.concat
-local unpack = unpack
-local assert = assert
-local log = function(...)
-  print('jet.peer',...)
-end
-module('jet.peer')
+
+local noop = jutils.noop
+local invalid_params = jutils.invalid_params
+local internal_error = jutils.internal_error
+local method_not_found = jutils.method_not_found
 
 local error_object = function(err)
   local error
   if type(err) == 'table' and err.code and err.message then
     error = err
   else
-    error = {
-      code = -32602,
-      message = 'Internal error',
-      data = err,
-    }
+    error = internal_error(err)
   end
   return error
 end
 
-new = function(config)
+local create_sock = function(config)
+  if not config.url then
+    local ip = config.ip or '127.0.0.1' -- localhost'
+    local port = config.port or 11122
+    if config.sync then
+      local sock = socket.connect(ip,port)
+      if not sock then
+        error('could not connect to jetd with ip:'..ip..' port:'..port)
+      end
+      return jsocket.wrap_sync(sock)
+    else
+      local loop = config.loop or ev.Loop.default
+      return jsocket.new({ip = ip, port = port, loop = loop})
+    end
+  else
+    if has_websockets then
+      local ws = websockets_ev()
+      ws:connect(config.url, 'jet')
+      return ws
+    else
+      error('no websockets available. install lua-websockets')
+    end
+  end
+end
+
+local new = function(config)
   config = config or {}
-  local ip = config.ip or '127.0.0.1' -- localhost'
-  local port = config.port or 11122
+  local log = config.log or noop
   local encode = cjson.encode
   local decode = cjson.decode
+  local wsock = create_sock(config)
   if config.sync then
-    local sock = socket.connect(ip,port)
-    if not sock then
-      error('could not connect to jetd with ip:'..ip..' port:'..port)
-    end
-    local wsock = jsocket.wrap_sync(sock)
     local id = 0
     local service = function(method,params,timeout)
       local rid
-      if not (timeout == false) then
-        id = id + 1
-        rid = id
-        params.timeout = timeout
-      end
-      wsock:send(encode
-        {
+      id = id + 1
+      rid = id
+      params.timeout = timeout -- maybe nil, defaults to 5secs at daemon
+      local data = encode({
           id = rid,
           method = method,
           params = params
       })
-      if not as_notification then
-        local response,err = wsock:receive()
-        if err then
-          error(err)
-        end
-        response = decode(response)
-        assert(response.id == rid)
-        if response.result then
-          return response.result
-        elseif response.error then
-          error(response.error,2)
-        else
-          assert(false,'invalid response:'..cjson.encode(response))
-        end
+      wsock:send(data)
+      local response,err = wsock:receive()
+      if err then
+        error(err)
+      end
+      response = decode(response)
+      assert(response.id == rid)
+      if response.result then
+        return response.result
+      elseif response.error then
+        error(response.error,2)
+      else
+        assert(false,'invalid response:'..cjson.encode(response))
       end
     end
     local j_sync = {}
-    j_sync.call = function(_,path,params,as_notification)
-      return service('call',{path=path,args=params or {}},as_notification)
+    j_sync.call = function(_,path,params,timeout)
+      return service('call',{path=path,args=params or {}},timeout)
     end
-    j_sync.set = function(_,path,value,as_notification)
-      return service('set',{path=path,value=value},as_notification)
+    j_sync.set = function(_,path,value,timeout)
+      return service('set',{path=path,value=value},timeout)
     end
-    j_sync.config = function(_,params,as_notification)
-      return service('config',params,as_notification)
+    j_sync.config = function(_,params,timeout)
+      return service('config',params,timeout)
+    end
+    j_sync.state = function(_,params,timeout)
+      return service('add',params,timeout)
     end
     return j_sync
   else
-    local sock = socket.tcp()
-    sock:settimeout(0)
     local loop = config.loop or ev.Loop.default
-    local wsock = jsocket.wrap(sock,{loop = loop})
     local messages = {}
     local queue = function(message)
       tinsert(messages,message)
@@ -100,9 +106,11 @@ new = function(config)
     local flush = function(reason)
       local n = #messages
       if n == 1 then
-        wsock:send(encode(messages[1]))
+        local data = encode(messages[1])
+        wsock:send(data)
       elseif n > 1 then
-        wsock:send(encode(messages))
+        local data = encode(messages)
+        wsock:send(data)
       end
       messages = {}
       will_flush = false
@@ -126,7 +134,7 @@ new = function(config)
           log('invalid result:',cjson.encode(message))
         end
       else
-        log('invalid result id:',id,cjson.encode(message))
+        log('invalid result id:',mid,cjson.encode(message))
       end
     end
     local on_no_dispatcher
@@ -143,10 +151,7 @@ new = function(config)
           error = error_object(err)
         end
       else
-        error = {
-          code = -32601,
-          message = 'Method not found'
-        }
+        error = method_not_found(message.method)
         if on_no_dispatcher then
           pcall(on_no_dispatcher,message)
         end
@@ -209,17 +214,7 @@ new = function(config)
     end
     
     j.close = function(self,options)
-      options = options or {}
-      if self.connect_io then
-        self.connect_io:stop(loop)
-      end
       flush('close')
-      if self.read_io then
-        self.read_io:stop(loop)
-        if options.clear_pending then
-          self.read_io:clear_pending(loop)
-        end
-      end
       wsock:close()
     end
     
@@ -275,7 +270,8 @@ new = function(config)
       if will_flush then
         queue(message)
       else
-        wsock:send(encode(message))
+        local data = encode(message)
+        wsock:send(data)
       end
     end
     
@@ -372,7 +368,9 @@ new = function(config)
       end
       if type(params) == 'string' then
         params = {
-          match = {params}
+          path = {
+            contains = params
+          }
         }
       end
       params.id = id
@@ -568,11 +566,7 @@ new = function(config)
             queue
             {
               id = mid,
-              error = error_object
-              {
-                code = -32602,
-                message = 'Invalid params',
-              }
+              error = invalid_params()
             }
           end
         end
@@ -607,11 +601,7 @@ new = function(config)
       cmsgpack = require'cmsgpack'
     end
     
-    local on_connect = function()
-      local connected,err = sock:connect(ip,port)
-      if connected or err == 'already connected' then
-        j.read_io = wsock:read_io()
-        j.read_io:start(loop)
+    wsock:on_open(function()
         if config.name or config.encoding then
           j:config({
               name = config.name,
@@ -635,23 +625,10 @@ new = function(config)
           config.on_connect(j)
         end
         flush('on_connect')
-      end
-    end
+      end)
     
-    local connected,err = sock:connect(ip,port)
-    if connected then
-      on_connect()
-    elseif err == 'timeout' then
-      j.connect_io = ev.IO.new(
-        function(loop,io)
-          io:stop(loop)
-          j.connect_io = nil
-          on_connect()
-        end,sock:getfd(),ev.WRITE)
-      j.connect_io:start(loop)
-    else
-      error('jet.peer.new failed: '..err)
-    end
+    wsock:connect()
+    
     return j
   end
 end
@@ -659,5 +636,3 @@ end
 return {
   new = new
 }
-
-
